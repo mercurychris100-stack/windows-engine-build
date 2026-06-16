@@ -11,8 +11,6 @@ jobs:
     - name: Set up Native Python 3.10
       uses: actions/setup-python@v5
       with:
-        # Pins the latest micro-patch of 3.10 to prevent the base 3.10.0 
-bug
         python-version: '3.10.11'
 
     - name: Install PyInstaller
@@ -21,13 +19,9 @@ bug
         pip install pyinstaller==6.3.0
 
     - name: Install Requirements Natively
-      # --only-binary=:all: pulls pre-built Windows wheels for 
-pandas/numpy
       run: pip install --only-binary=:all: -r requirements.txt
 
     - name: Build Windows Executable
-      # --noconsole hides the black command prompt box permanently on 
-Windows
       run: pyinstaller --onefile --noconsole --clean --paths=. engine.py
 
     - name: Upload Finished EXE
