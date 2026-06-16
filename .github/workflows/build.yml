@@ -11,23 +11,23 @@ jobs:
     - name: Set up Native Python 3.10
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        # Pins the latest micro-patch of 3.10 to prevent the base 3.10.0 
+bug
+        python-version: '3.10.11'
 
-    - name: Install Base Tooling
+    - name: Install PyInstaller
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller
+        pip install pyinstaller==6.3.0
 
-    - name: Install Requirements Safely
-      # --only-binary=:all: forces pip to download pre-compiled versions 
-of pandas/numpy 
-      # instead of compiling them from scratch, preventing the build 
-crash.
+    - name: Install Requirements Natively
+      # --only-binary=:all: pulls pre-built Windows wheels for 
+pandas/numpy
       run: pip install --only-binary=:all: -r requirements.txt
 
     - name: Build Windows Executable
-      # Re-adding the noconsole flag to completely hide the black popup 
-window
+      # --noconsole hides the black command prompt box permanently on 
+Windows
       run: pyinstaller --onefile --noconsole --clean --paths=. engine.py
 
     - name: Upload Finished EXE
