@@ -9,7 +9,7 @@ yarl
 loguru
 pandas
 numpy<2.0
-websockets==10.4
+websockets
 psutil
 pytz
 pydantic
