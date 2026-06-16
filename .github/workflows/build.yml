@@ -19,10 +19,11 @@ jobs:
         pip install pyinstaller pandas aiohttp websockets
 
     - name: Build Windows Executable
-      # Notice we explicitly pass your full folder name to --hidden-import
-      run: pyinstaller --onefile --clean --paths=. 
---hidden-import=websockets --hidden-import=aiohttp 
---hidden-import=pocketoptionapi_async engine.py
+      # --collect-all explicitly deep-scans your local folder to pack 
+every file, metadata, and script inside it
+      run: pyinstaller --onefile --clean --paths=. --collect-all 
+pocketoptionapi_async --hidden-import=websockets --hidden-import=aiohttp 
+engine.py
 
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
