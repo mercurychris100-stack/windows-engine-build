@@ -13,18 +13,23 @@ jobs:
       with:
         python-version: '3.10.11'
 
-    - name: Install PyInstaller Tooling
+    - name: Install Tools
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller==6.3.0
+        pip install pyinstaller==6.3.0 pyarmor
 
-    - name: Install Requirements Natively
+    - name: Install Requirements
       run: |
         pip install --only-binary=:all: -r requirements.txt
 
     - name: Build Windows Executable
+      env:
+        PYTHONUTF8: "1"
+        PYTHONIOENCODING: "utf-8"
       run: |
-        pyinstaller --onefile --noconsole --clean --paths=. engine.py
+        pyarmor cfg encoding="utf-8"
+        pyarmor cfg pack:pyi_options="--onefile --noconsole --clean --paths=."
+        pyarmor gen --pack onefile engine.py
 
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
