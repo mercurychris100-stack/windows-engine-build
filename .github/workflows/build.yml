@@ -1,36 +1,30 @@
 name: Build Windows Application
 on: [push]
-
 jobs:
   compile-exe:
     runs-on: windows-latest
     steps:
     - name: Check out repository code
       uses: actions/checkout@v4
-
     - name: Set up Native Python 3.10
       uses: actions/setup-python@v5
       with:
         python-version: '3.10.11'
-
     - name: Install Tools
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller==6.3.0 pyarmor
-
     - name: Install Requirements
       run: |
         pip install --only-binary=:all: -r requirements.txt
-
     - name: Build Windows Executable
       env:
         PYTHONUTF8: "1"
         PYTHONIOENCODING: "utf-8"
       run: |
         pyarmor cfg encoding="utf-8"
-        pyarmor cfg pack:pyi_options="--onefile --noconsole --clean --paths=."
+        pyarmor cfg pack:pyi_options="--onefile --noconsole --clean --add-data pocketoptionapi_async;pocketoptionapi_async --hidden-import loguru --hidden-import websockets --hidden-import aiohttp_cors --hidden-import pandas --hidden-import numpy --hidden-import statistics --hidden-import csv --icon logo.ico"
         pyarmor gen --pack onefile engine.py
-
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
       with:
