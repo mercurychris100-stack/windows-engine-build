@@ -316,7 +316,11 @@ class AsyncWebSocketClient:
 
         try:
             await self.websocket.send(message)
-            logger.debug(f"Sent message: {message}")
+            # Encode safely for logging — the message may contain SSID or
+            # other characters that Windows CP1252 can't handle. Replace
+            # unencodable characters with '?' rather than crashing.
+            safe_msg = message.encode('utf-8', errors='replace').decode('ascii', errors='replace')
+            logger.debug(f"Sent message: {safe_msg}")
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
             raise WebSocketError(f"Failed to send message: {e}")
@@ -513,7 +517,7 @@ class AsyncWebSocketClient:
                 try:
                     # Try to parse as JSON (like old API)
                     json_data = json.loads(decoded_message)
-                    logger.debug(f"Received JSON bytes message: {json_data}")
+                    logger.debug(f"Received JSON bytes message: {str(json_data).encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
 
                     # Handle balance data (like old API)
                     if "balance" in json_data:
@@ -555,7 +559,7 @@ class AsyncWebSocketClient:
             if isinstance(message, bytes):
                 message = message.decode("utf-8")
 
-            logger.debug(f"Received message: {message}")
+            logger.debug(f"Received message: {message.encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
 
             # Handle different message types
             if message.startswith("0") and "sid" in message:
@@ -625,7 +629,7 @@ class AsyncWebSocketClient:
             if isinstance(message, bytes):
                 message = message.decode("utf-8")
 
-            logger.debug(f"Received message: {message}")
+            logger.debug(f"Received message: {message.encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
 
             # Check cache first
             message_hash = hash(message)
