@@ -11,6 +11,7 @@ import numpy as np
 import re  
 from aiohttp import web        
 import aiohttp_cors 
+import io  # Added for safe text wrapping
 
 # ==============================================================================
 # 1. CRITICAL: Stable Event Loop Policy for Windows Executables
@@ -79,8 +80,9 @@ if is_exe:
     root_logger.addHandler(stderr_handler)
 else:
     # --- LIVE DEVELOPMENT TERMINAL MODE ---
-    # Stream everything directly to your console screen for instant debugging
-    console_handler = logging.StreamHandler(sys.__stdout__)  # Uses raw console channel
+    # Stream safely to console using an explicit UTF-8 wrapper to prevent charmap crashes
+    safe_stdout = io.TextIOWrapper(sys.__stdout__.buffer, encoding='utf-8', errors='replace')
+    console_handler = logging.StreamHandler(safe_stdout)  
     console_handler.setFormatter(log_formatter)
     console_handler.setLevel(logging.INFO)
     root_logger.addHandler(console_handler)
