@@ -1593,23 +1593,10 @@ class AsyncPocketOptionClient:
         # subscribers. The keep-alive manager restores the raw connection
         # but the server treats it as a fresh session — existing subscriptions
         # are not remembered server-side, so we must re-request each one.
-        # We wait for the "authenticated" event rather than a blind timer,
-        # because _send_handshake sends auth and returns immediately without
-        # waiting for successauth — which arrives asynchronously in
-        # _message_loop. Firing changeSymbol before successauth is processed
-        # causes the server to silently ignore the subscription request.
+        # Without this, _stream_subscriptions still has the callbacks but
+        # no ticks ever arrive because the server was never asked to send them.
         if self._stream_subscriptions:
-            # The keep-alive manager has its own separate websocket and
-            # message loop (_message_loop in connection_keep_alive.py).
-            # Auth confirmation ("successauth") is processed there and
-            # emitted via its own _emit_event system — separate from
-            # client._websocket's event handlers. We can't hook into it
-            # directly, so we wait a safe fixed interval that covers the
-            # auth round-trip before sending changeSymbol.
-            # 3 seconds is conservative enough to cover even a slow server
-            # response without being so long that it causes visible lag.
-            await asyncio.sleep(3.0)
-
+            await asyncio.sleep(2.0)  # let server finish session setup first
             for asset in list(self._stream_subscriptions.keys()):
                 try:
                     data_payload = {"asset": str(asset), "period": 5}

@@ -227,25 +227,9 @@ class AsyncWebSocketClient:
             # The structure is a list containing a list, where the first element
             # of the inner list is '5' (indicating payout data), and the rest is the data.
 
-            # Remove the initial '[[5,' and the final ']]' and parse the remaining as JSON.
-            # A more robust way is to find the first '[' and last ']' of the actual JSON array.
-
-            # Find the start of the actual JSON array data
-            json_start_index = message.find("[", message.find("[") + 1)
-            # Find the end of the actual JSON array data
-            json_end_index = message.rfind("]")
-
-            if json_start_index == -1 or json_end_index == -1:
-                logger.warning(
-                    f"Could not find valid JSON array in payout message: {message[:100]}..."
-                )
-                return
-
-            # Extract the inner JSON string that represents the array of arrays
-            json_str = message[json_start_index : json_end_index + 1]
-
-            # Parse the extracted JSON string
-            data: List[List[Any]] = json.loads(json_str)
+            # Parse the full message directly as JSON
+            # The message is already a valid JSON array like [[5,"#AAPL",...],[170,"#AAPL_otc",...],...]
+            data: List[List[Any]] = json.loads(message)
 
             # Iterate through each asset's payout information
             for asset_data in data:
@@ -548,6 +532,15 @@ class AsyncWebSocketClient:
                     elif "requestId" in json_data and json_data["requestId"] == "buy":
                         await self._emit_event("order_data", json_data)
 
+                    # Handle payout data (asset list with payout at index 5)
+                    # Payout messages always have an integer as first element of first subarray
+                    # Stream messages have a string (symbol) as first element — must not be routed here
+                    elif (isinstance(json_data, list) and len(json_data) > 0 and 
+                          isinstance(json_data[0], list) and len(json_data[0]) > 5 and
+                          isinstance(json_data[0][0], int)):
+                        # This is the [[5, asset_id, symbol, name, type, payout, ...]] format
+                        await self._handle_payout_message(decoded_message)
+                    
                     # Handle other JSON data
                     else:
                         await self._emit_event("json_data", json_data)

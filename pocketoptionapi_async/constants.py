@@ -10,7 +10,8 @@ ASSETS: Dict[str, int] = {
     # Major Forex Pairs
     "EURUSD": 1, "GBPUSD": 56, "USDJPY": 63, "USDCHF": 62, "USDCAD": 61, "AUDUSD": 40, "NZDUSD": 90,
     "EURCAD": 10, "GBPCAD": 83, 
-    
+    "CADJPY": 11,  # <--- INJECTED
+
     # OTC Forex Pairs
     "EURUSD_otc": 66, "GBPUSD_otc": 86, "USDJPY_otc": 93, "USDCHF_otc": 92, "USDCAD_otc": 91,
     "AUDUSD_otc": 71, "AUDNZD_otc": 70, "AUDCAD_otc": 67, "AUDCHF_otc": 68, "AUDJPY_otc": 69,
@@ -18,6 +19,9 @@ ASSETS: Dict[str, int] = {
     "EURJPY_otc": 79, "EURNZD_otc": 80, "GBPAUD_otc": 81, "GBPJPY_otc": 84, "NZDJPY_otc": 89,
     "NZDUSD_otc": 90,
     "EURCAD_otc": 166, "GBPCAD_otc": 168, "GBPAUD_otc": 160, "AUDCHF_otc": 161,
+    "EURAUD_otc": 162,  # <--- INJECTED
+    "GBPNZD_otc": 163,  # <--- INJECTED
+    "LBPUSD_otc": 202,  # <--- INJECTED
 
     # --- REGIONAL OTC EXOTICS ---
     "KESUSD_otc": 173, "NGNUSD_otc": 172, "ZARUSD_otc": 171, "UAHUSD_otc": 170, "USDVND_otc": 174,
@@ -26,6 +30,7 @@ ASSETS: Dict[str, int] = {
     "AEDCNY_otc": 185, "BHDCNY_otc": 186, "JODCNY_otc": 187, "OMRCNY_otc": 188, "QARCNY_otc": 189,
     "SARCNY_otc": 190, "MADUSD_otc": 191, "TNDUSD_otc": 192, "YERUSD_otc": 193, "EURTRY_otc": 194,
     "USDCLP_otc": 195, "USDCNH_otc": 196, "USDDZD_otc": 197, "USDEGP_otc": 198, "USDSGD_otc": 201,
+    "USDINR_otc": 164,  # <--- INJECTED
 
     # --- CRYPTOCURRENCIES (Extended 2026) ---
     "BTCUSD": 197, "BTCUSD_otc": 197, "ETHUSD": 272, "ETHUSD_otc": 272,
@@ -33,6 +38,8 @@ ASSETS: Dict[str, int] = {
     "TONUSD_otc": 501, "AVAXUSD_otc": 502, "DOGEUSD_otc": 503, "SOLUSD_otc": 504,
     "MATICUSD_otc": 505, "ADAUSD_otc": 506, "TRXUSD_otc": 507, "DOTUSD": 458,
     "DOTUSD_otc": 458, "LNKUSD": 464, "DASH_USD": 209, "CRYPTIDX_otc": 450,
+    "LINKUSD_otc": 464,  # <--- INJECTED
+    "BNBUSD_otc": 508,   # <--- INJECTED
 
     # Commodities
     "XAUUSD": 2, "XAUUSD_otc": 169, "XAGUSD": 65, "XAGUSD_otc": 167,
