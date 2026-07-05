@@ -517,7 +517,8 @@ class AsyncWebSocketClient:
                 try:
                     # Try to parse as JSON (like old API)
                     json_data = json.loads(decoded_message)
-                    logger.debug(f"Received JSON bytes message: {str(json_data).encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
+                    safe_json = str(json_data).encode('utf-8', errors='replace').decode('ascii', errors='replace')
+                    logger.debug(f"Received JSON bytes message: {safe_json}")
 
                     # Handle balance data (like old API)
                     if "balance" in json_data:
@@ -559,7 +560,8 @@ class AsyncWebSocketClient:
             if isinstance(message, bytes):
                 message = message.decode("utf-8")
 
-            logger.debug(f"Received message: {message.encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
+            safe_msg_563 = message.encode('utf-8', errors='replace').decode('ascii', errors='replace')
+            logger.debug(f"Received message: {safe_msg_563}")
 
             # Handle different message types
             if message.startswith("0") and "sid" in message:
@@ -629,7 +631,8 @@ class AsyncWebSocketClient:
             if isinstance(message, bytes):
                 message = message.decode("utf-8")
 
-            logger.debug(f"Received message: {message.encode("utf-8", errors="replace").decode("ascii", errors="replace")}")
+            safe_msg_634 = message.encode('utf-8', errors='replace').decode('ascii', errors='replace')
+            logger.debug(f"Received message: {safe_msg_634}")
 
             # Check cache first
             message_hash = hash(message)
