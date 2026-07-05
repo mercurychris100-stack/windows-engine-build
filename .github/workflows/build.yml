@@ -25,8 +25,8 @@ jobs:
         # 1. Let PyArmor obfuscate your code safely into the dist/ directory
         pyarmor gen engine.py
         
-        # 2. Let PyInstaller cleanly handle the executable and Windows flags natively
-        pyinstaller --onefile --noconsole --clean --add-data "pocketoptionapi_async;pocketoptionapi_async" --hidden-import loguru --hidden-import websockets --hidden-import aiohttp_cors --hidden-import pandas --hidden-import numpy --hidden-import statistics --hidden-import csv --icon logo.ico dist/engine.py
+        # 2. Collect core packages completely to prevent any missing module errors
+        pyinstaller --onefile --noconsole --clean --add-data "pocketoptionapi_async;pocketoptionapi_async" --hidden-import loguru --hidden-import websockets --hidden-import aiohttp_cors --hidden-import pandas --hidden-import numpy --hidden-import statistics --hidden-import csv --collect-all pocketoptionapi_async --collect-all pydantic --collect-all pydantic_core --collect-all aiohttp --collect-all pydantic_settings --icon logo.ico dist/engine.py
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
       with:
