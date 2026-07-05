@@ -436,7 +436,12 @@ def get_signals_improved(asset_str):
 
     BASE_Z_THRESHOLD         = 1.5
     BASE_PULLBACK_Z          = 0.6
-    BASE_TREND_CONSISTENCY   = 0.62
+    BASE_TREND_CONSISTENCY   = 0.55   # Loosened from 0.62 — 0.62 was too strict on 5s OTC feeds,
+                                       # causing the trend branch to almost never fire. 0.55 means
+                                       # 55% of ticks agreeing on direction counts as trending.
+                                       # Testing on EURCHF specifically to see if looser trend
+                                       # detection improves win rate on an asset where range
+                                       # reversion consistently underperformed (37.5% historically).
     Z_ESCALATION_PER_STEP    = 0.5
     PULLBACK_ESC_PER_STEP    = 0.3
     CONSIST_ESC_PER_STEP     = 0.05
