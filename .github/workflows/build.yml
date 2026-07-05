@@ -22,13 +22,10 @@ jobs:
         PYTHONUTF8: "1"
         PYTHONIOENCODING: "utf-8"
       run: |
-        # 1. Let PyArmor obfuscate your code safely into the dist/ directory
+        # 1. PyArmor encrypts your code into dist/engine.py
         pyarmor gen engine.py
         
-        # 2. Modify the spec file on the fly to target the obfuscated engine file instead of the raw one
-        (Get-Content engine.spec) -replace "'engine.py'", "'dist/engine.py'" | Set-Content engine.spec
-        
-        # 3. Build natively via PyInstaller using your exact local hooks and submodules
+        # 2. PyInstaller builds it using the smart spec file paths
         pyinstaller engine.spec
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
