@@ -3,24 +3,18 @@ import os
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
-# ==============================================================================
-# FORCE BOOTLOADER UTF-8 ENVIRONMENT OVERRIDES
-# ==============================================================================
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-block_cipher = None
+# FIX: This automatically finds the correct folder on GitHub's Windows computer
+site_packages = [p for p in sys.path if 'site-packages' in p]
 
-# Collect ALL submodules and data from pocketoptionapi_async so PyInstaller
-# registers them as importable modules, not just copies them as data files.
-# Using datas alone causes "No module named" errors at runtime because the
-# files are present but not on Python's import path inside the exe.
 pocketoption_modules = collect_submodules('pocketoptionapi_async')
 pocketoption_datas   = collect_data_files('pocketoptionapi_async')
 
 a = Analysis(
-    ['engine.py'],
-    pathex=['.'],
+    ['dist/engine.py'],  # Points to PyArmor folder
+    pathex=['.', *site_packages], # Automatically uses the Windows path on GitHub
     binaries=[],
     datas=[
         ('pocketoptionapi_async', 'pocketoptionapi_async'),
@@ -36,16 +30,18 @@ a = Analysis(
         'numpy',
         'statistics',
         'csv',
+        'pydantic',        # Explicitly tells Windows to include Pydantic
+        'pydantic_core',   # Explicitly tells Windows to include Pydantic Core
         *pocketoption_modules,
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['runtime_hook.py'],
+    runtime_hooks=['runtime_hook.py'] if os.path.exists('runtime_hook.py') else [],
     excludes=[],
     noarchive=False,
     optimize=0,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -61,11 +57,11 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,      # Hides the console window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['logo.ico'],
+    icon=['logo.ico'],  # Adds your logo
 )
