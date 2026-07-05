@@ -40,12 +40,13 @@ is_exe = getattr(sys, 'frozen', False)
 if is_exe:
     base_path = os.path.join(sys._MEIPASS, "pocketoptionapi_async")
     
-    # EXE MODE: Direct raw/unhandled terminal garbage to a silent null void 
-    # This prevents black command prompt windows from flickering with text.
-    sys.stdout = open(os.devnull, 'w')
-    sys.stderr = open(os.devnull, 'w')
+    # EXE MODE: Safely sink raw/unhandled terminal text into a UTF-8 compliant void
+    # This prevents the background 'charmap' codec crash entirely when libraries bypass logging.
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 else:
     base_path = os.path.join(os.getcwd(), "pocketoptionapi_async")
+
     # TERMINAL MODE: Standard stdout/stderr are preserved so you see direct data!
 
 if base_path not in sys.path:
