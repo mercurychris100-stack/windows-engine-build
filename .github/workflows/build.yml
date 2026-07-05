@@ -22,8 +22,11 @@ jobs:
         PYTHONUTF8: "1"
         PYTHONIOENCODING: "utf-8"
       run: |
-        # WE PASS EVERYTHING DIRECTLY TO THE PACK TEMPLATE IN ONE SHOT
-        pyarmor gen --pack "onefile --noconsole --icon logo.ico --add-data pocketoptionapi_async;pocketoptionapi_async --hidden-import loguru --hidden-import websockets --hidden-import aiohttp_cors --hidden-import pandas --hidden-import numpy --hidden-import statistics --hidden-import csv" engine.py
+        # 1. Let PyArmor obfuscate your code safely into the dist/ directory
+        pyarmor gen engine.py
+        
+        # 2. Let PyInstaller cleanly handle the executable and Windows flags natively
+        pyinstaller --onefile --noconsole --clean --add-data "pocketoptionapi_async;pocketoptionapi_async" --hidden-import loguru --hidden-import websockets --hidden-import aiohttp_cors --hidden-import pandas --hidden-import numpy --hidden-import statistics --hidden-import csv --icon logo.ico dist/engine.py
     - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
       with:
