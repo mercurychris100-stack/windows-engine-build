@@ -152,6 +152,9 @@ state = {
     "consecutive_losses": 0,      # Live count of consecutive confirmed losses (reset on win)
     "_vol_blocked": False,        # Live volatility gate state per asset cycle
     "asset_stats": {},            # Per-asset W/L history for adaptive threshold calibration
+    "last_trade_time": 0,         # Shared cooldown timer — set by both the automated
+                                   # loop and the manual TRADE action so the two can't
+                                   # fire overlapping trades within the same window
     # =========================================================================
 }
 
@@ -198,6 +201,30 @@ def format_asset(raw_asset):
     return clean_key
 
 import time 
+
+def detect_demo_from_ssid(raw_ssid: str) -> bool:
+    """
+    Reads the actual isDemo value out of the pasted SSID string itself —
+    the same value the login handshake in client.py already honors —
+    instead of engine.py using a fixed, disconnected value of its own.
+
+    This is what closes the gap between "what account we're logged into"
+    (decided by the pasted SSID) and "what mode we tell the client to use
+    for trading" (previously always hardcoded True here, regardless of
+    what was actually pasted).
+
+    Defaults to True (demo) if the field can't be found at all, since
+    that's the safer failure mode.
+    """
+    try:
+        match = re.search(r'"isDemo"\s*:\s*(true|false|1|0)', str(raw_ssid), re.IGNORECASE)
+        if match:
+            val = match.group(1).lower()
+            return val in ("1", "true")
+    except Exception:
+        pass
+    return True  # Safe default when the field is missing/unparseable
+
 
 async def connection_monitor():
     """Background task to ensure the API stays connected while running."""
@@ -836,7 +863,6 @@ import logging
 async def strategy_loop():
     global state
     last_requested_asset = None
-    last_trade_time = 0
 
     while True:
         if state["daily_profit"] >= state["daily_goal"]:
@@ -983,12 +1009,12 @@ async def strategy_loop():
                     # has passed since the last trade (cooldown) and no trade is
                     # currently active. The signal is still computed (for the rate
                     # counter) but not logged repeatedly during the cooldown window.
-                    in_cooldown = (current_time - last_trade_time) <= 15
+                    in_cooldown = (current_time - state.get("last_trade_time", 0)) <= 15
 
                     if signal and not in_cooldown:
                         if state.get("is_paused"):
                             continue
-                        last_trade_time = current_time
+                        state["last_trade_time"] = current_time
                         state["is_trading"] = True
 
                         logging.info(f"🎯 SIGNAL: {signal.upper()} | Level: {state['current_step'] + 1} | Stake: ${stake}")
@@ -1035,7 +1061,21 @@ async def handle_request(request):
         if action == 'SYNC':
             new_min = safe_int(data.get('min_payout'), 90)
             target_asset = format_asset(data.get('asset', 'EURUSD_otc'))
-            
+
+            # --- DEMO-ONLY GATE ---
+            # Reads the real value straight out of the pasted SSID (same
+            # check used later to configure the client) and refuses to
+            # proceed at all if it isn't clearly demo. No client is created,
+            # no connection is attempted — this engine simply never accepts
+            # a live session, full stop.
+            incoming_ssid = data.get('ssid', '')
+            if not detect_demo_from_ssid(incoming_ssid):
+                logging.warning("🚫 LIVE SSID REJECTED: this engine only runs demo sessions.")
+                return web.json_response({
+                    "status": "error",
+                    "message": "This bot only runs on demo accounts. Live sessions are not accepted."
+                }, status=403)
+
             state.update({
                 "active_asset": target_asset,
                 "base_amount": round(float(data.get('base_amount', 1.0)), 3),
@@ -1056,14 +1096,28 @@ async def handle_request(request):
             state["current_stake"] = state["base_amount"]
             state["daily_profit"] = 0.0 
             state["last_bar_time"] = 0 
+            # Wipe the rolling price buffer on every fresh SYNC. Without this,
+            # a same-asset restart shortly after a STOP left the old buffer
+            # in place, so the very first fresh tick could be evaluated
+            # against stale prices from the previous session and fire a
+            # signal off data that has nothing to do with the new session.
+            state["tick_tracker"] = {}
+            state["_vol_blocked"] = False
 
             async def start_session():
                 try:
                     if state.get("client"):
                         try: await state["client"].disconnect()
                         except Exception: pass
-                    
-                    state["client"] = AsyncPocketOptionClient(state["ssid"], is_demo=True)
+
+                    detected_is_demo = detect_demo_from_ssid(state["ssid"])
+                    state["is_demo"] = detected_is_demo
+                    logging.info(
+                        f"🔎 SSID MODE DETECTED: {'DEMO' if detected_is_demo else 'LIVE'} "
+                        f"(read directly from pasted SSID, not assumed)"
+                    )
+
+                    state["client"] = AsyncPocketOptionClient(state["ssid"], is_demo=detected_is_demo)
                     await state["client"].connect()
                     try:
                         await state["client"].subscribe_symbol_stream(
@@ -1087,6 +1141,12 @@ async def handle_request(request):
             # FIXED: Encapsulated into a protected task container to prevent overlapping automated trades
             async def manual_trade_worker():
                 state["is_trading"] = True
+                # Set the shared cooldown timer BEFORE firing, same as the
+                # automated loop does. Without this, the automated loop had
+                # no way to know a trade just went out manually, and could
+                # fire its own trade on top of this one within the same
+                # martingale window.
+                state["last_trade_time"] = asyncio.get_event_loop().time()
                 try:
                     await place_new_order(user_asset, amount, direction)
                 finally:
@@ -1153,6 +1213,57 @@ async def handle_request(request):
                 "last_trade": {"asset": state["active_asset"]}
             })
 
+        # --- 3b. MANUAL ASSET SWITCH (mid-martingale, no reset) ---
+        # Lets the user swap the active asset while the bot is paused
+        # (e.g. waiting out a low-payout window) without touching
+        # current_step, current_stake, daily_profit, or consecutive_losses.
+        # Those fields are asset-agnostic already, so a switch here is a
+        # pure re-target: strategy_loop() will unsubscribe the old symbol
+        # and subscribe the new one on its own the next time it runs
+        # (it compares state["active_asset"] against last_requested_asset),
+        # then continue the martingale sequence exactly where it left off.
+        if action == 'SWITCH_ASSET':
+            if not state.get("is_paused"):
+                return web.json_response({
+                    "status": "error",
+                    "message": "Pause the bot before switching assets."
+                }, status=400)
+
+            new_asset_raw = data.get("asset")
+            if not new_asset_raw:
+                return web.json_response({
+                    "status": "error",
+                    "message": "No asset provided."
+                }, status=400)
+
+            new_asset = format_asset(new_asset_raw)
+            old_asset = state.get("active_asset")
+
+            if new_asset == old_asset:
+                return web.json_response({"status": "ok", "active_asset": new_asset, "message": "Already active."})
+
+            state["active_asset"] = new_asset
+            # Force a fresh warm-up buffer for the new symbol rather than
+            # reusing stale ticks left over from a previous session on it.
+            state.get("tick_tracker", {}).pop(new_asset, None)
+            state["last_bar_time"] = 0
+            state["_vol_blocked"] = False
+
+            logging.info(
+                f"🔀 MANUAL ASSET SWITCH: {old_asset} → {new_asset} "
+                f"(Step {state.get('current_step', 0)} preserved, "
+                f"Stake ${state.get('current_stake', 0):.2f} preserved, "
+                f"Profit ${state.get('daily_profit', 0):.2f} preserved)"
+            )
+
+            return web.json_response({
+                "status": "ok",
+                "active_asset": new_asset,
+                "current_step": state.get("current_step", 0),
+                "current_stake": state.get("current_stake", 0),
+                "daily_profit": state.get("daily_profit", 0),
+            })
+
         # --- 4. STANDARD ACTIONS ---
         if action == 'STOP': 
             state["is_running"] = False 
@@ -1172,6 +1283,7 @@ async def handle_request(request):
             # Manual RESUME — always works regardless of manual_pause flag
             state["is_paused"] = False
             state["manual_pause"] = False
+            return web.json_response({"status": "ok"})
 
         if action == 'AUTO_RESUME':
             # Auto RESUME from payout recovery — only works if not manually paused
