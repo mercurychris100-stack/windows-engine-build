@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import statistics
+import math
 import csv
 from collections import deque
 import pandas as pd
@@ -141,6 +142,8 @@ state = {
     "alerts": [], 
     "payout": 0,                  # Block trading until WebSocket delivers real payout data
     "min_payout": 90,
+    "content_payout": None,       # Content script's own scraped-vs-websocket decision
+    "content_payout_time": 0,     # When content_payout was last reported, for freshness checks
     "active_asset": "EURUSD_otc",
     "last_trade": {"asset": "EURUSD_otc", "status": "WAITING"},
     
@@ -310,6 +313,9 @@ async def payout_monitor():
                     state["last_stream_time"] = time.time()
                 
                 # Direct, lightweight lookup from the clean library dictionary
+                # — kept exactly as before, still fetched every cycle "as
+                # usual". This is now used as the FALLBACK, not necessarily
+                # the value the pause decision is based on.
                 raw = (
                     p_map.get(asset) or
                     p_map.get(asset.lower()) or
@@ -318,23 +324,41 @@ async def payout_monitor():
                     p_map.get(asset.replace("_otc", "").lower()) or
                     p_map.get(asset.replace("_otc", "").upper())
                 )
+                ws_payout = int(float(raw)) if raw is not None else 0
+
+                # state["payout"] always stays the RAW websocket number — the
+                # content script reads this back to run its own
+                # scraped-vs-websocket comparison, so this must never be
+                # overwritten with a derived value or it'd create a feedback
+                # loop with itself.
+                state["payout"] = ws_payout
+
+                # Defer to the content script's own final decision (scraped
+                # vs websocket, chart-match aware) when it has reported
+                # something within the last 5 seconds — it polls once a
+                # second, so anything older than that means the extension
+                # isn't actively reporting right now (tab closed, page
+                # reloaded, etc). In that case, fall back to the raw
+                # websocket read exactly as before.
+                content_payout = state.get("content_payout")
+                content_payout_time = state.get("content_payout_time", 0)
+                content_is_fresh = (content_payout is not None) and (time.time() - content_payout_time <= 5)
+                effective_payout = content_payout if content_is_fresh else ws_payout
 
                 target_threshold = state.get("min_payout", 80)
-                
-                if raw is not None:
-                    # Clean type casting: The library already scaled this to a clean float/int
-                    state["payout"] = int(float(raw))
-                    state["alerts"] = [a for a in state.get("alerts", []) if "LOW PAYOUT" not in a]
-                    
-                    if state["payout"] < target_threshold:
-                        state["is_paused"] = True
-                        # NOTE: Never auto-resume if user manually paused
-                        state["alerts"].append(f"⚠️ LOW PAYOUT: {state['payout']}%")
-                else:
-                    # Treat an completely missing asset map key cleanly without dropping connection
-                    state["payout"] = 0
-                    state["is_paused"] = True  
-                    state["alerts"] = [a for a in state.get("alerts", []) if "LOW PAYOUT" not in a]
+                state["alerts"] = [a for a in state.get("alerts", []) if "LOW PAYOUT" not in a]
+
+                if effective_payout > 0 and effective_payout < target_threshold:
+                    state["is_paused"] = True
+                    # NOTE: Never auto-resume if user manually paused
+                    source = "content script" if content_is_fresh else "WebSocket"
+                    state["alerts"].append(f"⚠️ LOW PAYOUT: {effective_payout}% (via {source})")
+                elif effective_payout == 0 and not content_is_fresh:
+                    # Only treat this as a hard data-feed-lagging case when we
+                    # also have no fresh content-script number to fall back
+                    # on — otherwise a momentary empty websocket map
+                    # shouldn't force a pause the content script disagrees with.
+                    state["is_paused"] = True
                     state["alerts"].append(f"⚠️ LOW PAYOUT: 0% (Data Feed Lagging for {asset})")
         except Exception as e:
             logging.error(f"❌ Error in payout calculation loop: {str(e)}")
@@ -497,7 +521,11 @@ def get_signals_improved(asset_str):
     prices = list(buffer)
 
     # -------------------------------------------------------------------
-    # REGIME DETECTION
+    # REGIME DETECTION — legacy tick-agreement measure.
+    # Kept computed and logged for side-by-side CSV comparison against
+    # the new method below, but no longer used to decide is_trending.
+    # On real data this stayed clustered around 0.50 (pure noise) at
+    # 5-second granularity and essentially never cleared the bar.
     # -------------------------------------------------------------------
     trend_window  = prices[-TREND_LOOKBACK:] if len(prices) >= TREND_LOOKBACK else prices
     net_move      = trend_window[-1] - trend_window[0]
@@ -505,8 +533,37 @@ def get_signals_improved(asset_str):
     agreeing      = sum(1 for d in diffs if d != 0 and (d > 0) == (net_move > 0))
     nonzero_diffs = sum(1 for d in diffs if d != 0)
     consistency   = (agreeing / nonzero_diffs) if nonzero_diffs else 0.0
-    is_trending   = consistency >= TREND_CONSISTENCY
-    trend_dir_up  = net_move > 0
+
+    # -------------------------------------------------------------------
+    # EXPERIMENTAL TREND DETECTION (DEMO ENGINE ONLY — real-money-tested
+    # via demo trades, meant to be evaluated from the signal log and
+    # removed if it doesn't hold up). Fits a straight line through the
+    # trend window and requires both a real slope AND a clean fit to
+    # that line (correlation strength), instead of counting raw
+    # tick-to-tick agreement. This block is self-contained: reverting to
+    # `is_trending = consistency >= TREND_CONSISTENCY` and
+    # `trend_dir_up = net_move > 0` above removes it cleanly.
+    # -------------------------------------------------------------------
+    BASE_FIT_QUALITY = 0.35   # starting bar for r² (fit strength to the trend line)
+    FIT_ESC_PER_STEP = 0.05   # demand a cleaner fit deeper into a losing streak — same shape as other bars
+
+    n = len(trend_window)
+    if n >= 2:
+        xs = list(range(n))
+        mean_x = (n - 1) / 2
+        mean_y = statistics.fmean(trend_window)
+        cov   = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(xs, trend_window))
+        var_x = sum((xi - mean_x) ** 2 for xi in xs)
+        var_y = sum((yi - mean_y) ** 2 for yi in trend_window)
+        slope = (cov / var_x) if var_x > 0 else 0.0
+        r     = (cov / math.sqrt(var_x * var_y)) if (var_x > 0 and var_y > 0) else 0.0
+        fit_quality = r * r
+    else:
+        slope, fit_quality = 0.0, 0.0
+
+    FIT_QUALITY_BAR = min(0.85, BASE_FIT_QUALITY + (current_step * FIT_ESC_PER_STEP))
+    is_trending  = (fit_quality >= FIT_QUALITY_BAR) and (slope != 0.0)
+    trend_dir_up = slope > 0
 
     # -------------------------------------------------------------------
     # DIRECTIONAL FILTER
@@ -517,6 +574,8 @@ def get_signals_improved(asset_str):
     # If the 60-tick drift is downward, skip CALL entries.
     # If the 60-tick drift is upward, skip PUT entries.
     # Applied to both range reversion and trend pullback branches.
+    # Deliberately untouched by the experimental trend detection above —
+    # still based on net_move, exactly as before.
     # -------------------------------------------------------------------
     macro_drift_up = net_move > 0  # same window as regime detection
 
@@ -540,6 +599,8 @@ def get_signals_improved(asset_str):
                 "step":        current_step,
                 "z_threshold": round(Z_THRESHOLD, 4),
                 "direction":   direction,
+                "slope":       round(slope, 6),
+                "fit_quality": round(fit_quality, 4),
             }
 
         # Single deceleration check (restored from previous engine)
@@ -557,8 +618,9 @@ def get_signals_improved(asset_str):
                     signal = "call"
                     state["_pending_signal_meta"] = _meta("trend", signal)
             elif (not trend_dir_up) and PULLBACK_Z <= z < Z_THRESHOLD:
-                # PUT unrestricted — performing well in data, no directional filter applied
-                if abs(z) >= MIN_EXECUTION_Z:
+                if macro_drift_up:
+                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping PUT — macro drift is upward")
+                elif abs(z) >= MIN_EXECUTION_Z:
                     logging.info(f"📉 TREND PULLBACK (dn): z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
                     signal = "put"
                     state["_pending_signal_meta"] = _meta("trend", signal)
@@ -571,8 +633,9 @@ def get_signals_improved(asset_str):
                     signal = "call"
                     state["_pending_signal_meta"] = _meta("range", signal)
             elif z >= Z_THRESHOLD and decelerating:
-                # PUT unrestricted — performing well in data, no directional filter applied
-                if abs(z) >= MIN_EXECUTION_Z:
+                if macro_drift_up:
+                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping PUT — macro drift is upward")
+                elif abs(z) >= MIN_EXECUTION_Z:
                     logging.info(f"⚡ RANGE REVERSION (high): z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
                     signal = "put"
                     state["_pending_signal_meta"] = _meta("range", signal)
@@ -605,6 +668,7 @@ SIGNAL_LOG_PATH = "signal_log.csv"
 _SIGNAL_LOG_FIELDS = [
     "timestamp", "asset", "regime", "consistency", "z", "step", "z_threshold",
     "direction", "stake", "trade_id", "outcome", "net_profit",
+    "slope", "fit_quality",  # EXPERIMENTAL trend detection — see get_signals_improved()
 ]
 
 
@@ -654,7 +718,27 @@ async def place_new_order(asset, stake, direction, meta=None):
             state["pre_trade_balance"] = float(account_info)
 
         logging.info(f"🎯 EXOTIC EXECUTION: {api_dir.upper()} | {target_asset} | ${stake:.2f}")
-        
+
+        # 2b. REAL FUNDS GUARDRAIL — checked against the actual account
+        # balance just fetched above, not the bot's internal virtual
+        # tracking. If the real account can't actually cover this stake,
+        # refuse outright and never call place_order() at all. This is
+        # what stops a trade from ever being sent when there's nothing
+        # real behind it, regardless of what the virtual goal-tracking
+        # thinks is available.
+        if state["pre_trade_balance"] < stake:
+            logging.warning(
+                f"🚫 INSUFFICIENT REAL FUNDS: balance ${state['pre_trade_balance']:.2f} "
+                f"< stake ${stake:.2f}. Trade refused, bot stopped."
+            )
+            state["alerts"].append(
+                f"🚫 INSUFFICIENT REAL FUNDS: balance ${state['pre_trade_balance']:.2f} "
+                f"is less than the ${stake:.2f} stake. Bot stopped."
+            )
+            state["is_running"] = False
+            state["is_trading"] = False  # Safe unlock
+            return "INSUFFICIENT_FUNDS"
+
         # 3. Fire the order instantly
         order = await state["client"].place_order(target_asset, stake, api_dir, state["duration"])
         
@@ -1161,11 +1245,18 @@ async def handle_request(request):
             if ui_asset:
                 state["active_asset"] = format_asset(ui_asset)
 
-            # Hybrid payout: use scraped page value if available, else keep WebSocket value
-            scraped_live = safe_int(data.get('scraped_payout'), 0)
-            if scraped_live > 0:
-                state["payout"] = scraped_live  # Page scrape is more accurate than WebSocket
-            # If scraped_live == 0, payout_monitor() WebSocket value remains unchanged
+            # The content script sends its OWN final payout decision here —
+            # the result of comparing scraped-vs-websocket with the
+            # chart-match rule already applied on its end. We store it
+            # separately (not into state["payout"]) because the content
+            # script's own next comparison depends on reading back the pure
+            # websocket value via state["payout"] — overwriting it here
+            # would create a feedback loop. payout_monitor() is what
+            # actually decides whether to trust this value or fall back.
+            final_payout = safe_int(data.get('final_payout'), 0)
+            if final_payout > 0:
+                state["content_payout"] = final_payout
+                state["content_payout_time"] = time.time()
 
             if 'min_payout' in data:
                 state["min_payout"] = safe_int(data.get('min_payout'), 90)
