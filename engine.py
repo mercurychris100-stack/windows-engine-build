@@ -1059,49 +1059,37 @@ async def strategy_loop():
                         continue
 
                     # -----------------------------------------------------------
-                    # LIVE VOLATILITY GATE: computed entirely from the tick buffer
-                    # in real time — no trade history needed. Compares the stdev
-                    # of the most recent 40 tick-to-tick changes against the stdev
-                    # of the preceding 120 tick-to-tick changes (the baseline).
-                    # If recent volatility is more than 1.5x the baseline, the
-                    # asset is behaving erratically right now and signal evaluation
-                    # is skipped entirely until it calms below 1.2x.
-                    # Windows widened from 20-vs-60 to 40-vs-120: the smaller
-                    # windows produced an unstable ratio on lower-liquidity
-                    # assets (confirmed from a real log: 237 closes/236 opens
-                    # across a single 8.5-hour session — flipping roughly every
-                    # 2 minutes, far more consistent with sampling noise than
-                    # genuine regime changes). Larger windows react slower to
-                    # real changes but shouldn't miss a genuine spike; this
-                    # trades some responsiveness for a trustworthier signal.
-                    # OPEN/CLOSED transitions are intentionally not logged —
-                    # kept purely as an internal gate, not written to
-                    # bot_log.txt, bot_error.txt, or the signal CSV.
+                    # LIVE VOLATILITY GATE — DISABLED for this test build, per
+                    # request, so mean reversion can run without this filter
+                    # interfering. Left in place (commented out) rather than
+                    # deleted, so it can be re-enabled by uncommenting the
+                    # block below if this test shows it's actually needed.
                     # -----------------------------------------------------------
-                    asset_tracker  = state.get("tick_tracker", {}).get(asset_str, {})
-                    vol_buffer     = asset_tracker.get("buffer")
-                    _vol_gate_open = True
+                    _vol_gate_open = True  # Gate bypassed — always open
 
-                    if vol_buffer and len(vol_buffer) >= 80:
-                        prices  = list(vol_buffer)
-                        returns = [abs(prices[i+1] - prices[i]) for i in range(len(prices)-1)]
-                        recent_vol   = statistics.pstdev(returns[-40:])  if len(returns) >= 40 else None
-                        baseline_vol = statistics.pstdev(returns[-160:-40]) if len(returns) >= 160 else (
-                                       statistics.pstdev(returns[:-40])   if len(returns) >= 80 else None)
-
-                        if recent_vol and baseline_vol and baseline_vol > 0:
-                            vol_ratio = recent_vol / baseline_vol
-                            _vol_blocked = state.get("_vol_blocked", False)
-
-                            if vol_ratio >= 1.5:
-                                state["_vol_blocked"] = True
-                                _vol_gate_open = False
-                            elif vol_ratio <= 1.2:
-                                state["_vol_blocked"] = False
-                            else:
-                                # in hysteresis band (1.2–1.5): maintain previous state
-                                if _vol_blocked:
-                                    _vol_gate_open = False
+                    # asset_tracker  = state.get("tick_tracker", {}).get(asset_str, {})
+                    # vol_buffer     = asset_tracker.get("buffer")
+                    #
+                    # if vol_buffer and len(vol_buffer) >= 80:
+                    #     prices  = list(vol_buffer)
+                    #     returns = [abs(prices[i+1] - prices[i]) for i in range(len(prices)-1)]
+                    #     recent_vol   = statistics.pstdev(returns[-40:])  if len(returns) >= 40 else None
+                    #     baseline_vol = statistics.pstdev(returns[-160:-40]) if len(returns) >= 160 else (
+                    #                    statistics.pstdev(returns[:-40])   if len(returns) >= 80 else None)
+                    #
+                    #     if recent_vol and baseline_vol and baseline_vol > 0:
+                    #         vol_ratio = recent_vol / baseline_vol
+                    #         _vol_blocked = state.get("_vol_blocked", False)
+                    #
+                    #         if vol_ratio >= 1.5:
+                    #             state["_vol_blocked"] = True
+                    #             _vol_gate_open = False
+                    #         elif vol_ratio <= 1.2:
+                    #             state["_vol_blocked"] = False
+                    #         else:
+                    #             # in hysteresis band (1.2–1.5): maintain previous state
+                    #             if _vol_blocked:
+                    #                 _vol_gate_open = False
 
                     if not _vol_gate_open:
                         await asyncio.sleep(0.5)
@@ -1392,6 +1380,20 @@ async def handle_request(request):
             state["is_paused"] = True
             state["manual_pause"] = True  # Manual override — auto resume will not clear this
             logging.info(f"⏸️ MANUAL PAUSE: {state.get('active_asset', '?')}")
+            return web.json_response({"status": "ok"})
+
+        if action == 'AUTO_PAUSE':
+            # Fired by the content script's own client-side low-payout
+            # detection — NOT a real human click. Deliberately does not
+            # touch manual_pause, so AUTO_RESUME can still clear this once
+            # payout genuinely recovers. Previously this shared the 'PAUSE'
+            # action with real manual clicks, which incorrectly set
+            # manual_pause=True and left the bot stuck until someone
+            # manually hit Resume, even after payout was fine again.
+            was_paused = state.get("is_paused", False)
+            state["is_paused"] = True
+            if not was_paused:
+                logging.warning(f"⏸️ AUTO-PAUSED (content script): {state.get('active_asset', '?')}")
             return web.json_response({"status": "ok"})
         
         if action == 'RESUME':
