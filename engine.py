@@ -347,12 +347,15 @@ async def payout_monitor():
 
                 target_threshold = state.get("min_payout", 80)
                 state["alerts"] = [a for a in state.get("alerts", []) if "LOW PAYOUT" not in a]
+                was_paused = state.get("is_paused", False)
 
                 if effective_payout > 0 and effective_payout < target_threshold:
                     state["is_paused"] = True
                     # NOTE: Never auto-resume if user manually paused
                     source = "content script" if content_is_fresh else "WebSocket"
                     state["alerts"].append(f"⚠️ LOW PAYOUT: {effective_payout}% (via {source})")
+                    if not was_paused:  # Only log the actual transition, not every cycle while already paused
+                        logging.warning(f"⏸️ AUTO-PAUSED: {asset} payout {effective_payout}% below {target_threshold}% minimum (source: {source})")
                 elif effective_payout == 0 and not content_is_fresh:
                     # Only treat this as a hard data-feed-lagging case when we
                     # also have no fresh content-script number to fall back
@@ -360,6 +363,8 @@ async def payout_monitor():
                     # shouldn't force a pause the content script disagrees with.
                     state["is_paused"] = True
                     state["alerts"].append(f"⚠️ LOW PAYOUT: 0% (Data Feed Lagging for {asset})")
+                    if not was_paused:
+                        logging.warning(f"⏸️ AUTO-PAUSED: {asset} data feed lagging (no payout data from either source)")
         except Exception as e:
             logging.error(f"❌ Error in payout calculation loop: {str(e)}")
             
@@ -964,15 +969,26 @@ async def strategy_loop():
             try:
                 asset_str = format_asset(state["active_asset"])
                 
-                # --- UPDATED: READ DIRECTLY FROM THE SINGLE SOURCE OF TRUTH ---
-                checked_payout = state.get("payout", 0)
-                # -----------------------------------------------------------
+                # --- SINGLE SOURCE OF TRUTH — same deference rule as
+                # payout_monitor(): trust the content script's own scraped-
+                # vs-websocket decision when it's been reported within the
+                # last 5 seconds, otherwise fall back to the raw websocket
+                # read. Previously this read state["payout"] (always the
+                # raw websocket number) directly, completely bypassing the
+                # content script's more accurate figure — meaning a low
+                # raw websocket reading could silently block trading here
+                # even when the real, accurate payout was fine.
+                content_payout = state.get("content_payout")
+                content_payout_time = state.get("content_payout_time", 0)
+                content_is_fresh = (content_payout is not None) and (time.time() - content_payout_time <= 5)
+                checked_payout = content_payout if content_is_fresh else state.get("payout", 0)
 
                 min_payout = state.get("min_payout", 80) 
 
                 if checked_payout < min_payout:
                     if int(asyncio.get_event_loop().time()) % 10 == 0:
-                        logging.warning(f"⏸️ PAYOUT PAUSE: {asset_str} at {checked_payout}% (Requires {min_payout}%)")
+                        source = "content script" if content_is_fresh else "WebSocket"
+                        logging.warning(f"⏸️ PAYOUT PAUSE: {asset_str} at {checked_payout}% (Requires {min_payout}%, source: {source})")
                     await asyncio.sleep(1)
                     continue
 
@@ -1045,35 +1061,42 @@ async def strategy_loop():
                     # -----------------------------------------------------------
                     # LIVE VOLATILITY GATE: computed entirely from the tick buffer
                     # in real time — no trade history needed. Compares the stdev
-                    # of the most recent 20 tick-to-tick changes against the stdev
-                    # of the preceding 60 tick-to-tick changes (the baseline).
+                    # of the most recent 40 tick-to-tick changes against the stdev
+                    # of the preceding 120 tick-to-tick changes (the baseline).
                     # If recent volatility is more than 1.5x the baseline, the
                     # asset is behaving erratically right now and signal evaluation
                     # is skipped entirely until it calms below 1.2x.
+                    # Windows widened from 20-vs-60 to 40-vs-120: the smaller
+                    # windows produced an unstable ratio on lower-liquidity
+                    # assets (confirmed from a real log: 237 closes/236 opens
+                    # across a single 8.5-hour session — flipping roughly every
+                    # 2 minutes, far more consistent with sampling noise than
+                    # genuine regime changes). Larger windows react slower to
+                    # real changes but shouldn't miss a genuine spike; this
+                    # trades some responsiveness for a trustworthier signal.
+                    # OPEN/CLOSED transitions are intentionally not logged —
+                    # kept purely as an internal gate, not written to
+                    # bot_log.txt, bot_error.txt, or the signal CSV.
                     # -----------------------------------------------------------
                     asset_tracker  = state.get("tick_tracker", {}).get(asset_str, {})
                     vol_buffer     = asset_tracker.get("buffer")
                     _vol_gate_open = True
 
-                    if vol_buffer and len(vol_buffer) >= 40:
+                    if vol_buffer and len(vol_buffer) >= 80:
                         prices  = list(vol_buffer)
                         returns = [abs(prices[i+1] - prices[i]) for i in range(len(prices)-1)]
-                        recent_vol   = statistics.pstdev(returns[-20:])  if len(returns) >= 20 else None
-                        baseline_vol = statistics.pstdev(returns[-80:-20]) if len(returns) >= 80 else (
-                                       statistics.pstdev(returns[:-20])   if len(returns) >= 40 else None)
+                        recent_vol   = statistics.pstdev(returns[-40:])  if len(returns) >= 40 else None
+                        baseline_vol = statistics.pstdev(returns[-160:-40]) if len(returns) >= 160 else (
+                                       statistics.pstdev(returns[:-40])   if len(returns) >= 80 else None)
 
                         if recent_vol and baseline_vol and baseline_vol > 0:
                             vol_ratio = recent_vol / baseline_vol
                             _vol_blocked = state.get("_vol_blocked", False)
 
                             if vol_ratio >= 1.5:
-                                if not _vol_blocked:
-                                    logging.warning(f"🌪️ VOLATILITY GATE CLOSED [{asset_str}]: ratio={vol_ratio:.2f}x — asset too erratic, skipping signals.")
                                 state["_vol_blocked"] = True
                                 _vol_gate_open = False
                             elif vol_ratio <= 1.2:
-                                if _vol_blocked:
-                                    logging.info(f"✅ VOLATILITY GATE OPEN [{asset_str}]: ratio={vol_ratio:.2f}x — resuming signals.")
                                 state["_vol_blocked"] = False
                             else:
                                 # in hysteresis band (1.2–1.5): maintain previous state
@@ -1368,23 +1391,28 @@ async def handle_request(request):
         if action == 'PAUSE': 
             state["is_paused"] = True
             state["manual_pause"] = True  # Manual override — auto resume will not clear this
+            logging.info(f"⏸️ MANUAL PAUSE: {state.get('active_asset', '?')}")
             return web.json_response({"status": "ok"})
         
         if action == 'RESUME':
             # Manual RESUME — always works regardless of manual_pause flag
             state["is_paused"] = False
             state["manual_pause"] = False
+            logging.info(f"▶️ MANUAL RESUME: {state.get('active_asset', '?')}")
             return web.json_response({"status": "ok"})
 
         if action == 'AUTO_RESUME':
             # Auto RESUME from payout recovery — only works if not manually paused
             if not state.get("manual_pause", False):
+                if state.get("is_paused"):
+                    logging.info(f"▶️ AUTO-RESUME: {state.get('active_asset', '?')} payout recovered and stable")
                 state["is_paused"] = False
             return web.json_response({"status": "ok"})
 
         if action == 'TOGGLE_PAUSE': 
             state["is_paused"] = not state["is_paused"]
             state["manual_pause"] = state["is_paused"]  # Sync manual_pause with toggled state
+            logging.info(f"{'⏸️ MANUAL PAUSE' if state['is_paused'] else '▶️ MANUAL RESUME'} (toggle): {state.get('active_asset', '?')}")
             return web.json_response({"status": "ok"})
 
         return web.json_response({"status": "unknown"})
