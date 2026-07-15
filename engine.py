@@ -54,6 +54,7 @@ if base_path not in sys.path:
     sys.path.append(base_path)
 
 from pocketoptionapi_async import AsyncPocketOptionClient, OrderDirection
+from pocketoptionapi_async.constants import ASSETS
 
 # ==============================================================================
 # 4. IMMACULATE TABULAR LOGGING MATRIX (Dynamic Dev vs. Production)
@@ -131,8 +132,12 @@ state = {
     "base_amount": 1.0, 
     "current_stake": 1.0, 
     "current_step": 0, 
-    "duration": 5, 
-    "chart_tf": 5, 
+    "duration": 5,                 # Trade expiry — always matches chart_tf, since the
+                                    # spec calls for the same expiry as the active timeframe
+    "chart_tf": 5,                 # The ONE active timeframe, set from the UI — any
+                                    # positive number of seconds is accepted, no
+                                    # restriction to a fixed list. Only this one is watched;
+                                    # switching it is the same idea as switching asset.
     "is_trading": False,
     "daily_profit": 0.0, 
     "daily_goal": 50.0,
@@ -150,16 +155,33 @@ state = {
     # =========================================================================
     # REAL-TIME INFRASTRUCTURE STORAGE INJECTIONS
     # =========================================================================
-    "tick_tracker": {},           # Holds live sub-second price buffers per asset
+    "bar_tracker": {},            # Per-asset bar aggregation for the ONE active
+                                   # timeframe (chart_tf) — see on_live_tick()
+    "last_processed_bar": {},     # Per asset — the start-time of the last bar
+                                   # this engine already evaluated, so a closed
+                                   # bar is only ever checked once, not
+                                   # re-checked on every loop tick
     "last_clock_skip_log": 0,     # Track timestamp signatures for clock protection
     "consecutive_losses": 0,      # Live count of consecutive confirmed losses (reset on win)
-    "_vol_blocked": False,        # Live volatility gate state per asset cycle
-    "asset_stats": {},            # Per-asset W/L history for adaptive threshold calibration
     "last_trade_time": 0,         # Shared cooldown timer — set by both the automated
                                    # loop and the manual TRADE action so the two can't
                                    # fire overlapping trades within the same window
     # =========================================================================
 }
+
+# The only valid values chart_tf can be set to — matches the spec's list of
+# timeframes this bot needs to support: 5s, 10s, 15s, 30s, 1min.
+# The only valid values chart_tf can be set to — matches the FULL spec list:
+# S5, S10, S15, S30, M1, M2, M3 (in seconds: 5, 10, 15, 30, 60, 120, 180).
+# Previously only had 5 of these 7 — M2 and M3 were silently unsupported.
+# No fixed list of "valid" timeframes — PocketOption's actual range (and
+# any future changes to it) shouldn't need to be hand-maintained here.
+# Any positive whole number of seconds is accepted; the only real check is
+# that it's a sane positive number, not a specific enumerated set.
+def is_valid_timeframe(tf):
+    return isinstance(tf, int) and tf > 0
+
+
 
 # --- 5. MASTER UNIVERSAL ASSET CLEANER ---
 def format_asset(raw_asset):
@@ -273,14 +295,14 @@ async def connection_monitor():
                     # confirmed, but the server needs a moment to finish its
                     # internal handshake before it can process a changeSymbol
                     # subscription request. Firing immediately causes the
-                    # changeSymbol to be silently ignored, leaving tick_tracker
+                    # changeSymbol to be silently ignored, leaving bar_tracker
                     # empty and the bot trading blind.
                     await asyncio.sleep(3.0)
 
                     # Item 13: Re-subscribe to the active asset stream after
                     # every reconnect. The library restores the raw connection
                     # but does NOT re-call subscribe_symbol_stream automatically,
-                    # so tick_tracker stops updating until either a manual Sync
+                    # so bar_tracker stops updating until either a manual Sync
                     # from the UI or this auto-resubscribe fires.
                     active_asset = state.get("active_asset")
                     chart_tf     = state.get("chart_tf", 5)
@@ -379,11 +401,17 @@ def on_live_tick(data):
     Persistent callback registered via client.subscribe_symbol_stream().
 
     Confirmed wire format from the library's _on_json_data dispatch is a flat
-    dict per tick: {"asset": ..., "time": ..., "price": ...}. Writes the
-    current price into state["tick_tracker"] so get_signals_improved() /
-    strategy_loop() can read it. Also maintains a short rolling buffer of
-    recent prices per asset, used to compute volatility-normalized (z-score)
-    signals instead of a fixed absolute threshold.
+    dict per tick: {"asset": ..., "time": ..., "price": ...}.
+
+    Unlike the tick-buffer approach in the z-score engines, this builds a
+    real OHLC bar from the incoming tick stream, for whichever ONE timeframe
+    is currently active (state["chart_tf"]) — set via the UI, same idea as
+    switching asset. Only that single timeframe is tracked; switching it
+    mid-session starts a fresh bar under the new interval. Each asset keeps
+    its own current (still-forming) bar and a short history of CLOSED bars.
+    A bar only ever gets added to that history once its time window has
+    actually elapsed — nothing here is ever evaluated while still forming,
+    which is what avoids the repainting problem discussed for ZigZag.
     """
     global state
     try:
@@ -393,287 +421,82 @@ def on_live_tick(data):
         if not asset_name or price <= 0:
             return
 
-        timeframe = state.get("chart_tf", 5) or 5
-        bracket_epoch = int(tick_time // timeframe) * timeframe
+        tf = state.get("chart_tf", 5)
+        tf_state = state["bar_tracker"].setdefault(asset_name, {"tf": tf, "current": None, "closed": deque(maxlen=3)})
 
-        tracker = state["tick_tracker"].setdefault(
-            asset_name, {"current_bracket": 0, "base_open": price, "buffer": deque(maxlen=150)}
-        )
-        if "buffer" not in tracker:
-            tracker["buffer"] = deque(maxlen=150)
+        # If the active timeframe changed since this asset's tracker was
+        # created, reset it — bars built under the old interval aren't
+        # valid under the new one.
+        if tf_state.get("tf") != tf:
+            tf_state["tf"] = tf
+            tf_state["current"] = None
+            tf_state["closed"].clear()
 
-        # Real-Time Reset: anchor the Open on the first tick of a new bracket
-        if tracker["current_bracket"] != bracket_epoch:
-            tracker["current_bracket"] = bracket_epoch
-            tracker["base_open"] = price
+        bucket_start = int(tick_time // tf) * tf
+        current = tf_state["current"]
 
-        tracker["last_price"] = price
-        tracker["timestamp"] = tick_time
-        tracker["buffer"].append(price)
+        if current is None or current["start"] != bucket_start:
+            # The previous bar's time window has elapsed — it's now closed
+            # and safe to evaluate. Push it into history before starting
+            # the new one.
+            if current is not None:
+                tf_state["closed"].append(current)
+            tf_state["current"] = {
+                "start": bucket_start,
+                "open": price, "high": price, "low": price, "close": price,
+            }
+        else:
+            current["high"]  = max(current["high"], price)
+            current["low"]   = min(current["low"], price)
+            current["close"] = price
     except Exception as e:
         logging.debug(f"on_live_tick parse failed: {e}")
 
 
-def get_asset_z_adjustment(asset_str):
+def check_bar_pattern(asset_name):
     """
-    Per-asset adaptive calibration (item 15).
+    Two-bar continuation pattern, evaluated only on CLOSED bars — bar[0] is
+    the most recently closed bar, bar[1] is the one before it. Reads
+    whichever timeframe is currently active for this asset in bar_tracker
+    (set by on_live_tick from state["chart_tf"]).
 
-    Tracks each asset's recent win/loss record independently and returns
-    a z-score adjustment to apply on top of the base escalated threshold.
-    The idea: if an asset is performing well (high win rate), loosen the
-    bar slightly so it trades more often. If it's struggling (low win rate),
-    tighten it so the bot is more selective on that specific asset.
+        LONG:  High[0]>=High[1] AND Low[0]>=Low[1] AND Close[0]>Open[0] AND Close[1]>Open[1]
+        SHORT: High[0]<=High[1] AND Low[0]<=Low[1] AND Close[0]<Open[0] AND Close[1]<Open[1]
 
-    Requires at least MIN_ASSET_TRADES resolved trades on this asset before
-    any adjustment is made — below that sample size the adjustment is 0.0
-    (neutral) to avoid overreacting to a handful of unlucky trades.
-
-    This runs off state["asset_stats"], which background_order_watchdog
-    updates after every resolved trade.
+    Not strict (>=/<=), matching the spec exactly as given — a tied high or
+    low still counts. Returns "call", "put", or None. Also returns the
+    start-time of bar[0], used by the caller to make sure each closed bar
+    only ever gets evaluated once, not re-checked every loop tick.
     """
-    MIN_ASSET_TRADES = 20       # minimum sample before any adjustment kicks in
-    TARGET_WIN_RATE  = 0.54     # above this → loosen slightly; below → tighten
-    MAX_ADJUSTMENT   = 0.5      # never adjust more than ±0.5 z-points
+    tf_state = state.get("bar_tracker", {}).get(asset_name)
+    if not tf_state:
+        return None, None
 
-    stats = state.get("asset_stats", {}).get(asset_str, {})
-    wins  = stats.get("wins", 0)
-    total = stats.get("wins", 0) + stats.get("losses", 0)
+    closed = tf_state["closed"]
+    if len(closed) < 2:
+        return None, None
 
-    if total < MIN_ASSET_TRADES:
-        return 0.0   # not enough data yet, no adjustment
+    bar0, bar1 = closed[-1], closed[-2]   # bar0 = most recent closed, bar1 = one before
 
-    win_rate = wins / total
-    deviation = win_rate - TARGET_WIN_RATE
+    is_long = (bar0["high"] >= bar1["high"] and bar0["low"] >= bar1["low"]
+               and bar0["close"] > bar0["open"] and bar1["close"] > bar1["open"])
+    is_short = (bar0["high"] <= bar1["high"] and bar0["low"] <= bar1["low"]
+                and bar0["close"] < bar0["open"] and bar1["close"] < bar1["open"])
 
-    # positive deviation (doing well)  → negative adjustment (lower bar, more trades)
-    # negative deviation (struggling)  → positive adjustment (raise bar, fewer trades)
-    raw_adj = -(deviation * 2.0)   # scale: 0.1 above/below target = ±0.2 z adjustment
-    adjustment = max(-MAX_ADJUSTMENT, min(MAX_ADJUSTMENT, raw_adj))
-
-    if abs(adjustment) >= 0.05:
-        logging.debug(f"📐 ASSET CALIBRATION [{asset_str}]: WR={win_rate:.1%} n={total} → z_adj={adjustment:+.2f}")
-
-    return adjustment
-
-
-def get_signals_improved(asset_str):
-    """
-    Regime-aware, streak-escalating signal engine.
-
-    Trend-following in trending conditions, mean-reversion in ranging
-    conditions. Both branches gate through a volatility-normalised z-score.
-
-    STREAK ESCALATION (item 9): after each consecutive loss the effective
-    z-bar, pullback requirement, and trend-consistency requirement all rise,
-    making the bot demand progressively stronger evidence the deeper into a
-    losing run it already is. On a win, current_step resets to 0 in
-    background_order_watchdog and all bars drop back to their BASE values.
-
-    CSV LOGGING (items 10+11): every fired signal now records the active
-    asset name, the current step, and the effective z_threshold so the CSV
-    can be used to calibrate these values with real data later.
-
-    :param asset_str: The current active asset (e.g., 'AUDCHF_otc')
-    :return: "call", "put", or None
-    """
-    global state
-    asset_tracker = state.get("tick_tracker", {}).get(asset_str, {})
-    buffer = asset_tracker.get("buffer")
-
-    TREND_LOOKBACK = 60
-    ENTRY_WINDOW   = 20
-
-    # -------------------------------------------------------------------
-    # STREAK-AWARE CONFIDENCE ESCALATION
-    # The bar for entry rises with every consecutive loss (current_step),
-    # and resets to BASE the moment a trade wins.
-    # -------------------------------------------------------------------
-    current_step = state.get("current_step", 0)
-
-    BASE_Z_THRESHOLD         = 1.5
-    BASE_PULLBACK_Z          = 0.6
-    BASE_TREND_CONSISTENCY   = 0.55   # Loosened from 0.62 — 0.62 was too strict on 5s OTC feeds,
-                                       # causing the trend branch to almost never fire. 0.55 means
-                                       # 55% of ticks agreeing on direction counts as trending.
-                                       # Testing on EURCHF specifically to see if looser trend
-                                       # detection improves win rate on an asset where range
-                                       # reversion consistently underperformed (37.5% historically).
-    Z_ESCALATION_PER_STEP    = 0.5
-    PULLBACK_ESC_PER_STEP    = 0.3
-    CONSIST_ESC_PER_STEP     = 0.05
-
-    Z_THRESHOLD        = min(2.5, BASE_Z_THRESHOLD       + (current_step * Z_ESCALATION_PER_STEP))
-    PULLBACK_Z         = min(1.5, BASE_PULLBACK_Z        + (current_step * PULLBACK_ESC_PER_STEP))
-    TREND_CONSISTENCY  = min(0.80, BASE_TREND_CONSISTENCY + (current_step * CONSIST_ESC_PER_STEP))
-
-    # Apply per-asset calibration on top of the escalated threshold.
-    asset_z_adj  = get_asset_z_adjustment(asset_str)
-    Z_THRESHOLD  = max(1.0, Z_THRESHOLD + asset_z_adj)
-    PULLBACK_Z   = max(0.3, PULLBACK_Z  + asset_z_adj * 0.5)
-
-    # Minimum execution z: at step 0 the evaluation bar is 1.5 but the bot
-    # only actually places a trade if z clears 1.8 — filtering out the
-    # weakest marginal entries at base stake without killing frequency.
-    # At step 1+ the escalated threshold already exceeds 1.8 so no change.
-    MIN_EXECUTION_Z = 1.8 if current_step == 0 else Z_THRESHOLD
-
-    MIN_SAMPLES = max(TREND_LOOKBACK, ENTRY_WINDOW) // 2
-
-    signal = None
-    if not buffer or len(buffer) < MIN_SAMPLES:
-        return None
-
-    prices = list(buffer)
-
-    # -------------------------------------------------------------------
-    # REGIME DETECTION — legacy tick-agreement measure.
-    # Kept computed and logged for side-by-side CSV comparison against
-    # the new method below, but no longer used to decide is_trending.
-    # On real data this stayed clustered around 0.50 (pure noise) at
-    # 5-second granularity and essentially never cleared the bar.
-    # -------------------------------------------------------------------
-    trend_window  = prices[-TREND_LOOKBACK:] if len(prices) >= TREND_LOOKBACK else prices
-    net_move      = trend_window[-1] - trend_window[0]
-    diffs         = [trend_window[i+1] - trend_window[i] for i in range(len(trend_window)-1)]
-    agreeing      = sum(1 for d in diffs if d != 0 and (d > 0) == (net_move > 0))
-    nonzero_diffs = sum(1 for d in diffs if d != 0)
-    consistency   = (agreeing / nonzero_diffs) if nonzero_diffs else 0.0
-
-    # -------------------------------------------------------------------
-    # EXPERIMENTAL TREND DETECTION (DEMO ENGINE ONLY — real-money-tested
-    # via demo trades, meant to be evaluated from the signal log and
-    # removed if it doesn't hold up). Fits a straight line through the
-    # trend window and requires both a real slope AND a clean fit to
-    # that line (correlation strength), instead of counting raw
-    # tick-to-tick agreement. This block is self-contained: reverting to
-    # `is_trending = consistency >= TREND_CONSISTENCY` and
-    # `trend_dir_up = net_move > 0` above removes it cleanly.
-    # -------------------------------------------------------------------
-    BASE_FIT_QUALITY = 0.35   # starting bar for r² (fit strength to the trend line)
-    FIT_ESC_PER_STEP = 0.05   # demand a cleaner fit deeper into a losing streak — same shape as other bars
-
-    n = len(trend_window)
-    if n >= 2:
-        xs = list(range(n))
-        mean_x = (n - 1) / 2
-        mean_y = statistics.fmean(trend_window)
-        cov   = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(xs, trend_window))
-        var_x = sum((xi - mean_x) ** 2 for xi in xs)
-        var_y = sum((yi - mean_y) ** 2 for yi in trend_window)
-        slope = (cov / var_x) if var_x > 0 else 0.0
-        r     = (cov / math.sqrt(var_x * var_y)) if (var_x > 0 and var_y > 0) else 0.0
-        fit_quality = r * r
-    else:
-        slope, fit_quality = 0.0, 0.0
-
-    FIT_QUALITY_BAR = min(0.85, BASE_FIT_QUALITY + (current_step * FIT_ESC_PER_STEP))
-    is_trending  = (fit_quality >= FIT_QUALITY_BAR) and (slope != 0.0)
-    trend_dir_up = slope > 0
-
-    # -------------------------------------------------------------------
-    # DIRECTIONAL FILTER
-    # Confirmed from data: CALL win rate significantly lower than PUT.
-    # Root cause: bot bets on upward reversion into a market that has a
-    # downward macro drift, and vice versa. Before firing any signal,
-    # check whether the macro direction opposes the intended bet.
-    # If the 60-tick drift is downward, skip CALL entries.
-    # If the 60-tick drift is upward, skip PUT entries.
-    # Applied to both range reversion and trend pullback branches.
-    # Deliberately untouched by the experimental trend detection above —
-    # still based on net_move, exactly as before.
-    # -------------------------------------------------------------------
-    macro_drift_up = net_move > 0  # same window as regime detection
-
-    # -------------------------------------------------------------------
-    # ENTRY CALC
-    # -------------------------------------------------------------------
-    entry_window = prices[-ENTRY_WINDOW:] if len(prices) >= ENTRY_WINDOW else prices
-    mean_price   = statistics.fmean(entry_window)
-    stdev_price  = statistics.pstdev(entry_window)
-    last_tick    = entry_window[-1]
-
-    if stdev_price > 0:
-        z = (last_tick - mean_price) / stdev_price
-
-        def _meta(regime, direction):
-            return {
-                "asset":       asset_str,
-                "regime":      regime,
-                "consistency": round(consistency, 4),
-                "z":           round(z, 4),
-                "step":        current_step,
-                "z_threshold": round(Z_THRESHOLD, 4),
-                "direction":   direction,
-                "slope":       round(slope, 6),
-                "fit_quality": round(fit_quality, 4),
-            }
-
-        # Single deceleration check (restored from previous engine)
-        if len(entry_window) >= 3:
-            decelerating = abs(entry_window[-1] - entry_window[-2]) < abs(entry_window[-2] - entry_window[-3])
-        else:
-            decelerating = False
-
-        if is_trending:
-            if trend_dir_up and -Z_THRESHOLD < z <= -PULLBACK_Z:
-                if not macro_drift_up:
-                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping CALL — macro drift is downward")
-                elif abs(z) >= MIN_EXECUTION_Z:
-                    logging.info(f"📈 TREND PULLBACK (up): z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
-                    signal = "call"
-                    state["_pending_signal_meta"] = _meta("trend", signal)
-            elif (not trend_dir_up) and PULLBACK_Z <= z < Z_THRESHOLD:
-                if macro_drift_up:
-                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping PUT — macro drift is upward")
-                elif abs(z) >= MIN_EXECUTION_Z:
-                    logging.info(f"📉 TREND PULLBACK (dn): z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
-                    signal = "put"
-                    state["_pending_signal_meta"] = _meta("trend", signal)
-        else:
-            if z <= -Z_THRESHOLD and decelerating:
-                if not macro_drift_up:
-                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping CALL — macro drift is downward")
-                elif abs(z) >= MIN_EXECUTION_Z:
-                    logging.info(f"⚡ RANGE REVERSION (low):  z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
-                    signal = "call"
-                    state["_pending_signal_meta"] = _meta("range", signal)
-            elif z >= Z_THRESHOLD and decelerating:
-                if macro_drift_up:
-                    logging.debug(f"🚫 DIRECTIONAL FILTER: skipping PUT — macro drift is upward")
-                elif abs(z) >= MIN_EXECUTION_Z:
-                    logging.info(f"⚡ RANGE REVERSION (high): z={z:.2f} consistency={consistency:.2f} step={current_step} z_bar={Z_THRESHOLD:.2f}")
-                    signal = "put"
-                    state["_pending_signal_meta"] = _meta("range", signal)
-
-    # -------------------------------------------------------------------
-    # CALIBRATION AID: signal rate + regime split logged every 5 minutes
-    # -------------------------------------------------------------------
-    now  = time.time()
-    rate = state.setdefault("_signal_rate", {"window_start": now, "count": 0,
-                                              "trend_w": 0, "trend_l": 0,
-                                              "range_w": 0, "range_l": 0})
-    if signal:
-        rate["count"] += 1
-
-    # Update regime win/loss counters from asset_stats
-    if now - rate["window_start"] >= 300:
-        all_stats = state.get("asset_stats", {})
-        tw = sum(s.get("wins",0)   for s in all_stats.values())
-        tl = sum(s.get("losses",0) for s in all_stats.values())
-        logging.info(f"📊 SIGNAL RATE: {rate['count']} signals in last 5 min ({rate['count']/5:.2f}/min)")
-        logging.info(f"📊 OVERALL STATS: W={tw} L={tl} WR={tw/(tw+tl)*100:.1f}%" if tw+tl else "📊 OVERALL STATS: No trades yet")
-        rate["window_start"] = now
-        rate["count"] = 0
-
-    return signal
+    if is_long:
+        return "call", bar0["start"]
+    if is_short:
+        return "put", bar0["start"]
+    return None, bar0["start"]
 
 
 
 SIGNAL_LOG_PATH = "signal_log.csv"
 _SIGNAL_LOG_FIELDS = [
-    "timestamp", "asset", "regime", "consistency", "z", "step", "z_threshold",
-    "direction", "stake", "trade_id", "outcome", "net_profit",
-    "slope", "fit_quality",  # EXPERIMENTAL trend detection — see get_signals_improved()
+    "timestamp", "asset", "timeframe", "direction", "stake", "trade_id",
+    "outcome", "net_profit", "step",
+    "bar0_open", "bar0_high", "bar0_low", "bar0_close",
+    "bar1_open", "bar1_high", "bar1_low", "bar1_close",
 ]
 
 
@@ -783,7 +606,18 @@ async def background_order_watchdog(trade_id, stake, meta=None):
     max_wait = state.get("duration", 60) + 15
     start_time = asyncio.get_event_loop().time()
     last_outcome = None
-    
+
+    # Defined BEFORE the try block, not inside it. Previously these were
+    # only set partway through the try block (after the timeout check),
+    # so if check_win() never resolved in time, the TimeoutError raised
+    # before reaching this line — jumping straight to the except block's
+    # fallback logic, which then crashed referencing asset_name before it
+    # had ever been assigned. Confirmed from a real crash log: the
+    # fallback correctly determined and logged the LOSS outcome, then
+    # crashed one line later on `if asset_name:`.
+    meta = meta or {}
+    asset_name = meta.get("asset", state.get("active_asset", ""))
+
     try:
         # Polling runs concurrently within this isolated background task wrapper
         while (asyncio.get_event_loop().time() - start_time) < max_wait:
@@ -800,10 +634,6 @@ async def background_order_watchdog(trade_id, stake, meta=None):
         status_str = str(last_outcome.get('status', '')).lower()
         raw_payout = float(last_outcome.get('profit', 0))
         is_actually_tie = any(x in status_str for x in ["draw", "tie", "equal"]) or (raw_payout == 0.0 and "win" not in status_str and "loss" not in status_str)
-        
-        # Process progression states cleanly
-        meta = meta or {}
-        asset_name = meta.get("asset", state.get("active_asset", ""))
 
         def _update_asset_stats(outcome_key):
             """Record win/loss for per-asset adaptive calibration."""
@@ -952,6 +782,7 @@ import logging
 async def strategy_loop():
     global state
     last_requested_asset = None
+    last_requested_tf = None
 
     while True:
         if state["daily_profit"] >= state["daily_goal"]:
@@ -968,16 +799,16 @@ async def strategy_loop():
             
             try:
                 asset_str = format_asset(state["active_asset"])
-                
+                chart_tf = state.get("chart_tf", 5)
+                if not is_valid_timeframe(chart_tf):
+                    chart_tf = 5
+                    state["chart_tf"] = 5
+
                 # --- SINGLE SOURCE OF TRUTH — same deference rule as
                 # payout_monitor(): trust the content script's own scraped-
                 # vs-websocket decision when it's been reported within the
                 # last 5 seconds, otherwise fall back to the raw websocket
-                # read. Previously this read state["payout"] (always the
-                # raw websocket number) directly, completely bypassing the
-                # content script's more accurate figure — meaning a low
-                # raw websocket reading could silently block trading here
-                # even when the real, accurate payout was fine.
+                # read.
                 content_payout = state.get("content_payout")
                 content_payout_time = state.get("content_payout_time", 0)
                 content_is_fresh = (content_payout is not None) and (time.time() - content_payout_time <= 5)
@@ -992,16 +823,20 @@ async def strategy_loop():
                     await asyncio.sleep(1)
                     continue
 
-
-                # ASSET SWITCH: close the old subscription and open a real one
-                # for the new asset via the proper persistent stream API.
-                if asset_str != last_requested_asset:
+                # ASSET/TIMEFRAME SWITCH: resubscribe whenever either the
+                # active asset OR the active timeframe changes — same idea
+                # as asset-switching in the other engines, just now also
+                # covering a mid-session timeframe change. on_live_tick()
+                # resets its own bar tracker for this asset automatically
+                # when it notices chart_tf has changed.
+                if asset_str != last_requested_asset or chart_tf != last_requested_tf:
                     try:
                         if last_requested_asset:
                             state["client"].unsubscribe_symbol_stream(last_requested_asset, on_live_tick)
-                        await state["client"].subscribe_symbol_stream(asset_str, state["chart_tf"], on_live_tick)
+                        await state["client"].subscribe_symbol_stream(asset_str, chart_tf, on_live_tick)
                         last_requested_asset = asset_str
-                        logging.info(f"📡 SUBSCRIBED: {asset_str} ({state['chart_tf']}s)")
+                        last_requested_tf = chart_tf
+                        logging.info(f"📡 SUBSCRIBED: {asset_str} ({chart_tf}s bars)")
                     except Exception as e:
                         logging.error(f"⚠️ Subscription Failed: {e}")
                         last_requested_asset = None  # Retry next loop
@@ -1013,8 +848,6 @@ async def strategy_loop():
                     current_time = asyncio.get_event_loop().time()
 
                     # --- BRAIN CENTER: SHIFT-BY-1 MARTINGALE ARITHMETIC ---
-                    virtual_balance = state.get("funds_to_risk", 0) + state.get("daily_profit", 0)
-                    
                     if state["current_step"] == 0:
                         stake = round(state["base_amount"], 2)
                     else:
@@ -1029,27 +862,13 @@ async def strategy_loop():
                                 stake = round(stake * mult, 2)
                             except:
                                 pass
-                        else:
-                            pass
 
                     state["current_stake"] = stake
-
-                    # NOTE: The pre-trade "stake > virtual_balance" hard-kill
-                    # that used to live here has been removed. It was shutting
-                    # the bot down based on a projected next-step amount before
-                    # the current trade had even resolved — meaning a win (which
-                    # would reset current_step to 0 and make the projection
-                    # irrelevant) could never save it. The real post-resolution
-                    # balance check now lives exclusively in
-                    # background_order_watchdog, which only fires after the
-                    # actual outcome is confirmed.
 
                     # -----------------------------------------------------------
                     # 3-LOSS PAUSE: after 3 consecutive losses, pause 60 seconds
                     # then resume at the EXACT same step — no reset, no ladder
-                    # change. consecutive_losses is incremented in
-                    # background_order_watchdog after each confirmed loss and
-                    # reset to 0 after each confirmed win.
+                    # change.
                     # -----------------------------------------------------------
                     if state.get("consecutive_losses", 0) >= 3:
                         logging.warning(f"⏸️ 3 CONSECUTIVE LOSSES: Pausing 60s. Resuming at Step {state['current_step']} (no reset)...")
@@ -1058,71 +877,46 @@ async def strategy_loop():
                         logging.info(f"▶️ RESUMING: Back at Step {state['current_step']} | Stake: ${stake}")
                         continue
 
-                    # -----------------------------------------------------------
-                    # LIVE VOLATILITY GATE — DISABLED for this test build, per
-                    # request, so mean reversion can run without this filter
-                    # interfering. Left in place (commented out) rather than
-                    # deleted, so it can be re-enabled by uncommenting the
-                    # block below if this test shows it's actually needed.
-                    # -----------------------------------------------------------
-                    _vol_gate_open = True  # Gate bypassed — always open
-
-                    # asset_tracker  = state.get("tick_tracker", {}).get(asset_str, {})
-                    # vol_buffer     = asset_tracker.get("buffer")
-                    #
-                    # if vol_buffer and len(vol_buffer) >= 80:
-                    #     prices  = list(vol_buffer)
-                    #     returns = [abs(prices[i+1] - prices[i]) for i in range(len(prices)-1)]
-                    #     recent_vol   = statistics.pstdev(returns[-40:])  if len(returns) >= 40 else None
-                    #     baseline_vol = statistics.pstdev(returns[-160:-40]) if len(returns) >= 160 else (
-                    #                    statistics.pstdev(returns[:-40])   if len(returns) >= 80 else None)
-                    #
-                    #     if recent_vol and baseline_vol and baseline_vol > 0:
-                    #         vol_ratio = recent_vol / baseline_vol
-                    #         _vol_blocked = state.get("_vol_blocked", False)
-                    #
-                    #         if vol_ratio >= 1.5:
-                    #             state["_vol_blocked"] = True
-                    #             _vol_gate_open = False
-                    #         elif vol_ratio <= 1.2:
-                    #             state["_vol_blocked"] = False
-                    #         else:
-                    #             # in hysteresis band (1.2–1.5): maintain previous state
-                    #             if _vol_blocked:
-                    #                 _vol_gate_open = False
-
-                    if not _vol_gate_open:
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    # Signal generation: regime-aware (trend pullback / range
-                    # reversion) engine. See get_signals_improved().
-                    signal = get_signals_improved(asset_str)
-                    signal_meta = dict(state.get("_pending_signal_meta") or {})
-
-                    # Suppress signal log spam: only evaluate+log if enough time
-                    # has passed since the last trade (cooldown) and no trade is
-                    # currently active. The signal is still computed (for the rate
-                    # counter) but not logged repeatedly during the cooldown window.
                     in_cooldown = (current_time - state.get("last_trade_time", 0)) <= 15
 
-                    if signal and not in_cooldown:
-                        if state.get("is_paused"):
-                            continue
-                        state["last_trade_time"] = current_time
-                        state["is_trading"] = True
+                    # -----------------------------------------------------------
+                    # BAR PATTERN CHECK — the single active asset/timeframe
+                    # only. Tracks the start-time of the last bar already
+                    # evaluated, so a closed bar is only ever checked once —
+                    # but if the pattern is still true on the NEXT closed
+                    # bar (a genuinely new event), it fires again.
+                    # -----------------------------------------------------------
+                    if not in_cooldown and not state.get("is_paused"):
+                        signal, bar0_start = check_bar_pattern(asset_str)
+                        last_seen = state["last_processed_bar"].get(asset_str)
 
-                        logging.info(f"🎯 SIGNAL: {signal.upper()} | Level: {state['current_step'] + 1} | Stake: ${stake}")
+                        if bar0_start is not None and bar0_start != last_seen:
+                            state["last_processed_bar"][asset_str] = bar0_start
 
-                        # Deduct stake immediately so the UI balance reflects the
-                        # live trade during its duration. background_order_watchdog
-                        # adds back the full payout on a win, or leaves the deduction
-                        # as-is on a loss.
-                        state["daily_profit"] -= stake
+                            if signal:
+                                tf_state = state["bar_tracker"][asset_str]
+                                bar0, bar1 = tf_state["closed"][-1], tf_state["closed"][-2]
 
-                        await place_new_order(asset_str, stake, signal, meta=signal_meta)
+                                state["last_trade_time"] = current_time
+                                state["is_trading"] = True
+                                state["duration"] = chart_tf  # expiry matches the active timeframe
 
-                        state["is_trading"] = False
+                                logging.info(f"🎯 SIGNAL: {signal.upper()} | {chart_tf}s bar | Level: {state['current_step'] + 1} | Stake: ${stake}")
+
+                                state["daily_profit"] -= stake
+
+                                trade_meta = {
+                                    "asset": asset_str, "timeframe": chart_tf, "direction": signal,
+                                    "step": state["current_step"],
+                                    "bar0_open": bar0["open"], "bar0_high": bar0["high"],
+                                    "bar0_low": bar0["low"],   "bar0_close": bar0["close"],
+                                    "bar1_open": bar1["open"], "bar1_high": bar1["high"],
+                                    "bar1_low": bar1["low"],   "bar1_close": bar1["close"],
+                                }
+
+                                await place_new_order(asset_str, stake, signal, meta=trade_meta)
+
+                                state["is_trading"] = False
 
                 # Handle timeout blocks safely without force-breaking token alignments
                 except (asyncio.TimeoutError, AttributeError):
@@ -1171,12 +965,23 @@ async def handle_request(request):
                     "message": "This bot only runs on demo accounts. Live sessions are not accepted."
                 }, status=403)
 
+            # Reject an invalid timeframe outright rather than silently
+            # Reject a nonsensical value (zero, negative) outright, but
+            # otherwise accept any timeframe — no hardcoded list to fall
+            # out of sync with what PocketOption actually offers.
+            requested_tf = int(data.get('chart_tf', 5))
+            if not is_valid_timeframe(requested_tf):
+                return web.json_response({
+                    "status": "error",
+                    "message": f"'{requested_tf}' isn't a valid timeframe — must be a positive number of seconds."
+                }, status=400)
+
             state.update({
                 "active_asset": target_asset,
                 "base_amount": round(float(data.get('base_amount', 1.0)), 3),
                 "multipliers": data.get('multipliers', [1.0] * 10),
-                "duration": int(data.get('duration', 5)),
-                "chart_tf": int(data.get('chart_tf', 5)),
+                "chart_tf": requested_tf,
+                "duration": requested_tf,  # Expiry always matches the active timeframe
                 "daily_goal": float(data.get('daily_goal', 50.0)),
                 "min_payout": new_min, 
                 "funds_to_risk": float(data.get('funds_to_risk', 400.0)),
@@ -1191,13 +996,12 @@ async def handle_request(request):
             state["current_stake"] = state["base_amount"]
             state["daily_profit"] = 0.0 
             state["last_bar_time"] = 0 
-            # Wipe the rolling price buffer on every fresh SYNC. Without this,
-            # a same-asset restart shortly after a STOP left the old buffer
+            # Wipe bar tracking on every fresh SYNC. Without this, a
+            # same-asset restart shortly after a STOP left old, stale bars
             # in place, so the very first fresh tick could be evaluated
-            # against stale prices from the previous session and fire a
-            # signal off data that has nothing to do with the new session.
-            state["tick_tracker"] = {}
-            state["_vol_blocked"] = False
+            # against bars that have nothing to do with the new session.
+            state["bar_tracker"] = {}
+            state["last_processed_bar"] = {}
 
             async def start_session():
                 try:
@@ -1341,15 +1145,27 @@ async def handle_request(request):
             new_asset = format_asset(new_asset_raw)
             old_asset = state.get("active_asset")
 
+            # Reject anything that isn't a real, tradeable PocketOption
+            # asset — reusing the exact same canonical list client.py
+            # itself trusts before subscribing or placing an order, so
+            # this can't drift out of sync with what's actually valid.
+            # A typo here would previously sail through silently and only
+            # fail later, quietly, when the engine tried to subscribe.
+            if new_asset not in ASSETS:
+                return web.json_response({
+                    "status": "error",
+                    "message": f"'{new_asset_raw}' is not a recognized asset. Check the spelling and try again."
+                }, status=400)
+
             if new_asset == old_asset:
                 return web.json_response({"status": "ok", "active_asset": new_asset, "message": "Already active."})
 
             state["active_asset"] = new_asset
-            # Force a fresh warm-up buffer for the new symbol rather than
-            # reusing stale ticks left over from a previous session on it.
-            state.get("tick_tracker", {}).pop(new_asset, None)
+            # Force a fresh bar tracker for the new symbol rather than
+            # reusing stale bars left over from a previous session on it.
+            state.get("bar_tracker", {}).pop(new_asset, None)
+            state.get("last_processed_bar", {}).pop(new_asset, None)
             state["last_bar_time"] = 0
-            state["_vol_blocked"] = False
 
             logging.info(
                 f"🔀 MANUAL ASSET SWITCH: {old_asset} → {new_asset} "
